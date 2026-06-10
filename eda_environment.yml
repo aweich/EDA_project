@@ -1,0 +1,13 @@
+name: eda_project
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - jupyterlab
+  - notebook
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - scipy
