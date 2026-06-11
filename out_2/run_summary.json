@@ -1,0 +1,140 @@
+{
+  "input_file": "test/eda_features_29_samples.csv",
+  "n_rows": 116,
+  "n_subjects": 29,
+  "subjects": [
+    "s1",
+    "s10",
+    "s11",
+    "s12",
+    "s13",
+    "s14",
+    "s15",
+    "s16",
+    "s17",
+    "s18",
+    "s19",
+    "s2",
+    "s20",
+    "s21",
+    "s22",
+    "s23",
+    "s24",
+    "s25",
+    "s26",
+    "s27",
+    "s28",
+    "s29",
+    "s3",
+    "s4",
+    "s5",
+    "s6",
+    "s7",
+    "s8",
+    "s9"
+  ],
+  "tasks": [
+    "rest0",
+    "task1",
+    "task2",
+    "task3"
+  ],
+  "raw_feature_cols": [
+    "Mean Tonic",
+    "Max Slope",
+    "Num Peaks",
+    "Mean Amplitude",
+    "Std Amplitude",
+    "Total Power",
+    "EDASymp Power"
+  ],
+  "feature_sets": {
+    "all_7_norm": [
+      "Mean Tonic_norm",
+      "Max Slope_norm",
+      "Num Peaks_norm",
+      "Mean Amplitude_norm",
+      "Std Amplitude_norm",
+      "Total Power_norm",
+      "EDASymp Power_norm"
+    ],
+    "all_7_plus_symp_ratio": [
+      "Mean Tonic_norm",
+      "Max Slope_norm",
+      "Num Peaks_norm",
+      "Mean Amplitude_norm",
+      "Std Amplitude_norm",
+      "Total Power_norm",
+      "EDASymp Power_norm",
+      "EDASymp_Ratio_norm"
+    ],
+    "no_count_plus_symp_ratio": [
+      "Mean Tonic_norm",
+      "Max Slope_norm",
+      "Mean Amplitude_norm",
+      "Std Amplitude_norm",
+      "Total Power_norm",
+      "EDASymp Power_norm",
+      "EDASymp_Ratio_norm"
+    ]
+  },
+  "best_spike_delta_config": {
+    "feature_set": "all_7_plus_symp_ratio",
+    "encoding": "population",
+    "T": 30,
+    "max_spikes": 10,
+    "epochs": 400,
+    "lr": 0.05,
+    "accuracy": 0.6206896551724138,
+    "balanced_accuracy": 0.6206896551724137,
+    "macro_f1": 0.6020898119434531,
+    "weighted_f1": 0.602089811943453,
+    "n_predictions": 116,
+    "method": "delta",
+    "config_id": 29,
+    "n_features": 8,
+    "n_subjects": 29
+  },
+  "best_spike_snn_config": {
+    "feature_set": "all_7_norm",
+    "encoding": "population",
+    "T": 30,
+    "max_spikes": 6,
+    "epochs": 100,
+    "lr": 0.001,
+    "accuracy": 0.5689655172413793,
+    "balanced_accuracy": 0.5689655172413793,
+    "macro_f1": 0.5570073629039881,
+    "weighted_f1": 0.5570073629039882,
+    "n_predictions": 116,
+    "method": "snntorch",
+    "config_id": 1,
+    "n_features": 7,
+    "n_subjects": 29
+  },
+  "classical_baselines_best_delta_feature_set": [
+    {
+      "model": "LogisticRegression",
+      "accuracy": 0.603448275862069,
+      "balanced_accuracy": 0.603448275862069,
+      "macro_f1": 0.5794241472812902,
+      "weighted_f1": 0.5794241472812902
+    },
+    {
+      "model": "LinearSVM",
+      "accuracy": 0.5517241379310345,
+      "balanced_accuracy": 0.5517241379310345,
+      "macro_f1": 0.5279889081732401,
+      "weighted_f1": 0.52798890817324
+    },
+    {
+      "model": "RBFSVM",
+      "accuracy": 0.5948275862068966,
+      "balanced_accuracy": 0.5948275862068966,
+      "macro_f1": 0.5702109924374179,
+      "weighted_f1": 0.5702109924374179
+    }
+  ],
+  "snntorch_available": true,
+  "note": "No data augmentation. Delta branch uses spike-count delta rule. snnTorch branch uses LIF neurons and surrogate-gradient training."
+}
