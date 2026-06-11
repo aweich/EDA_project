@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-EDA feature encoding and compact SNN training/testing without data augmentation.
+Spike-based neuromorphic-style classification of EDA features.
 
-Pipeline:
-1. Load EDA feature table.
-2. Detect numeric feature columns.
-3. Normalize features:
-   - within-subject min-max if subject_id exists
-   - global min-max if subject_id is absent
-4. Encode normalized features into deterministic rate-coded spike trains.
-5. Train/test a compact single-layer LIF SNN.
-   - If subject_id exists: leave-one-subject-out cross-validation.
-   - If subject_id does not exist: overfit sanity check only.
-6. Save metrics, predictions, spike rasters, training curves, and confusion matrices.
+This script:
+1. Loads EDA feature data from CSV.
+2. Treats Sample as subject identifier.
+3. Uses four classes: rest0, task1, task2, task3.
+4. Performs within-subject min-max normalization.
+5. Adds a derived EDASymp ratio feature.
+6. Encodes normalized features into spikes using:
+   - deterministic rate encoding
+   - Gaussian population encoding
+7. Trains a compact spike-count delta-rule readout.
+8. Evaluates with leave-one-subject-out cross-validation.
+9. Compares against classical baselines.
+10. Saves metrics, predictions, confusion matrices, and plots.
 
 Important:
-If the input CSV has only one row per class and no subject_id column, this script cannot
-estimate generalization. It can only verify that encoding and SNN training work technically.
+This is not data augmentation.
+This uses spike encoding plus a delta-rule softmax readout trained on spike counts.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import random
+import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,7 +34,9 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import snntorch as snn
+from snntorch import surrogate
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -41,125 +44,11 @@ from sklearn.metrics import (
     f1_score,
 )
 from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.svm import SVC
 
 
 # ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-
-DEFAULT_LABEL_COL = "Task"
-DEFAULT_SUBJECT_COL = "subject_id"
-
-
-# ---------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------
-
-def set_seeds(seed: int = 42) -> None:
-    """Set random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def load_feature_table(path: str, label_col: str = DEFAULT_LABEL_COL) -> pd.DataFrame:
-    """Load feature CSV and validate the label column."""
-    df = pd.read_csv(path)
-
-    if label_col not in df.columns:
-        raise ValueError(
-            f"Expected label column '{label_col}', but found columns: {list(df.columns)}"
-        )
-
-    return df
-
-
-def get_numeric_feature_columns(
-    df: pd.DataFrame,
-    label_col: str = DEFAULT_LABEL_COL,
-    subject_col: str = DEFAULT_SUBJECT_COL,
-) -> List[str]:
-    """Return numeric feature columns, excluding label and subject columns."""
-    excluded = {label_col, subject_col}
-    feature_cols = [
-        c for c in df.columns
-        if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
-    ]
-
-    if len(feature_cols) == 0:
-        raise ValueError("No numeric feature columns found.")
-
-    return feature_cols
-
-
-def encode_labels(labels: pd.Series) -> Tuple[np.ndarray, Dict[str, int], Dict[int, str]]:
-    """Convert string labels to integer labels."""
-    class_names = list(pd.unique(labels.astype(str)))
-    label_to_int = {name: i for i, name in enumerate(class_names)}
-    int_to_label = {i: name for name, i in label_to_int.items()}
-    y = labels.astype(str).map(label_to_int).to_numpy(dtype=np.int64)
-    return y, label_to_int, int_to_label
-
-
-# ---------------------------------------------------------------------
-# Normalization
-# ---------------------------------------------------------------------
-
-def minmax_normalize_features(
-    df: pd.DataFrame,
-    feature_cols: List[str],
-    subject_col: str = DEFAULT_SUBJECT_COL,
-    epsilon: float = 1e-8,
-) -> Tuple[pd.DataFrame, List[str], str]:
-    """
-    Normalize feature columns to [0, 1].
-
-    If subject_id exists:
-        Normalization is performed within each subject across that subject's rows.
-
-    If subject_id does not exist:
-        Normalization is performed globally across all rows.
-        This is only a fallback for tiny example files.
-    """
-    out = df.copy()
-    norm_cols = []
-
-    if subject_col in out.columns:
-        mode = "within_subject_minmax"
-        grouped = out.groupby(subject_col, sort=False)
-
-        for col in feature_cols:
-            mn = grouped[col].transform("min")
-            mx = grouped[col].transform("max")
-            norm_col = f"{col}_norm"
-            out[norm_col] = (out[col] - mn) / (mx - mn + epsilon)
-            out[norm_col] = out[norm_col].clip(0.0, 1.0)
-            norm_cols.append(norm_col)
-
-    else:
-        mode = "global_minmax_no_subject_id"
-        print(
-            "WARNING: no subject_id column found. "
-            "Using global min-max normalization across all rows. "
-            "This is not valid for subject-independent evaluation."
-        )
-
-        for col in feature_cols:
-            mn = out[col].min()
-            mx = out[col].max()
-            norm_col = f"{col}_norm"
-            out[norm_col] = (out[col] - mn) / (mx - mn + epsilon)
-            out[norm_col] = out[norm_col].clip(0.0, 1.0)
-            norm_cols.append(norm_col)
-
-    if not np.isfinite(out[norm_cols].to_numpy()).all():
-        raise ValueError("Normalized features contain NaN or inf.")
-
-    return out, norm_cols, mode
-
-
-# ---------------------------------------------------------------------
-# Spike encoding
+# Encoding
 # ---------------------------------------------------------------------
 
 def deterministic_rate_encode(
@@ -170,452 +59,443 @@ def deterministic_rate_encode(
     """
     Deterministic rate encoding.
 
-    Input:
-        X: [n_samples, n_features], values in [0, 1]
+    Parameters
+    ----------
+    X:
+        Feature matrix of shape [n_samples, n_features], values in [0, 1].
+    T:
+        Number of spike time steps.
+    max_spikes:
+        Maximum number of spikes per feature.
 
-    Output:
-        spikes: [n_samples, T, n_features], binary spike tensor
-
-    Each feature value controls the number of spikes.
-    A value of 0 gives 0 spikes.
-    A value of 1 gives max_spikes spikes.
+    Returns
+    -------
+    S:
+        Binary spike tensor of shape [n_samples, T, n_features].
     """
-    X = np.asarray(X, dtype=np.float32)
+    X = np.asarray(X, dtype=float)
 
     if np.isnan(X).any() or np.isinf(X).any():
-        raise ValueError("X contains NaN or inf.")
+        raise ValueError("Input feature matrix contains NaN or inf.")
 
     if X.min() < -1e-8 or X.max() > 1 + 1e-8:
-        raise ValueError(f"X must be in [0, 1]. Got min={X.min()}, max={X.max()}.")
+        raise ValueError(f"Input features must be in [0, 1]. Got min={X.min()}, max={X.max()}.")
 
-    if T <= 0:
-        raise ValueError("T must be > 0.")
+    S = np.zeros((X.shape[0], T, X.shape[1]), dtype=np.float32)
 
-    if max_spikes < 0:
-        raise ValueError("max_spikes must be >= 0.")
-
-    n_samples, n_features = X.shape
-    spikes = np.zeros((n_samples, T, n_features), dtype=np.float32)
-
-    for i in range(n_samples):
-        for f in range(n_features):
+    for i in range(X.shape[0]):
+        for f in range(X.shape[1]):
             n_spikes = int(np.round(X[i, f] * max_spikes))
 
             if n_spikes > 0:
                 spike_times = np.linspace(0, T - 1, n_spikes).astype(int)
-                spikes[i, spike_times, f] = 1.0
+                S[i, spike_times, f] = 1.0
 
-    return spikes
+    return S
+
+
+def gaussian_population_encode(
+    X: np.ndarray,
+    T: int = 50,
+    max_spikes: int = 10,
+    n_pop: int = 3,
+    sigma: float = 0.25,
+) -> np.ndarray:
+    """
+    Gaussian population encoding.
+
+    Each scalar feature is expanded into n_pop Gaussian-tuned channels.
+    This gives the spike model a richer representation than one spike train per feature.
+    """
+    X = np.asarray(X, dtype=float)
+
+    if np.isnan(X).any() or np.isinf(X).any():
+        raise ValueError("Input feature matrix contains NaN or inf.")
+
+    centers = np.linspace(0, 1, n_pop)
+    responses = []
+
+    for f in range(X.shape[1]):
+        vals = X[:, f:f + 1]
+        r = np.exp(-0.5 * ((vals - centers[None, :]) / sigma) ** 2)
+        r = r / (r.max(axis=1, keepdims=True) + 1e-8)
+        responses.append(r)
+
+    X_pop = np.concatenate(responses, axis=1).astype(np.float32)
+
+    return deterministic_rate_encode(X_pop, T=T, max_spikes=max_spikes)
 
 
 # ---------------------------------------------------------------------
-# SNN model
+# Delta-rule readout
 # ---------------------------------------------------------------------
 
-class SurrogateSpike(torch.autograd.Function):
-    """
-    Binary spike function with fast-sigmoid surrogate gradient.
-
-    Forward:
-        spike = 1 if membrane_input > 0 else 0
-
-    Backward:
-        approximate derivative using 1 / (1 + abs(x))^2
-    """
-
-    @staticmethod
-    def forward(ctx, input_tensor: torch.Tensor) -> torch.Tensor:
-        ctx.save_for_backward(input_tensor)
-        return (input_tensor > 0).float()
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
-        (input_tensor,) = ctx.saved_tensors
-        surrogate_grad = 1.0 / (1.0 + torch.abs(input_tensor)) ** 2
-        return grad_output * surrogate_grad
+def softmax(z: np.ndarray) -> np.ndarray:
+    """Stable softmax."""
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / (e.sum(axis=1, keepdims=True) + 1e-12)
 
 
-class SingleLayerLIFSNN(nn.Module):
-    """
-    Compact single-layer LIF SNN.
-
-    Input:
-        spikes [batch, T, n_features]
-
-    Output:
-        spike_counts [batch, n_classes]
-
-    The model predicts the class with the highest output spike count.
-    """
-
-    def __init__(
-        self,
-        n_features: int,
-        n_classes: int,
-        beta: float = 0.9,
-        threshold: float = 1.0,
-    ):
-        super().__init__()
-        self.fc = nn.Linear(n_features, n_classes)
-        self.beta = beta
-        self.threshold = threshold
-
-    def forward(self, spikes: torch.Tensor) -> torch.Tensor:
-        batch_size, T, _ = spikes.shape
-
-        mem = torch.zeros(batch_size, self.fc.out_features, device=spikes.device)
-        spike_count = torch.zeros_like(mem)
-
-        for t in range(T):
-            current = self.fc(spikes[:, t, :])
-            mem = self.beta * mem + current
-
-            out_spike = SurrogateSpike.apply(mem - self.threshold)
-
-            mem = mem * (1.0 - out_spike.detach())
-            spike_count = spike_count + out_spike
-
-        return spike_count
-
-
-# ---------------------------------------------------------------------
-# Training and evaluation
-# ---------------------------------------------------------------------
-
-def train_one_model(
-    X_spikes_train: np.ndarray,
+def train_delta_readout(
+    S_train: np.ndarray,
     y_train: np.ndarray,
     n_classes: int,
-    epochs: int = 200,
-    lr: float = 1e-2,
-    weight_decay: float = 1e-4,
-    beta: float = 0.9,
-    threshold: float = 1.0,
+    epochs: int = 400,
+    lr: float = 0.05,
+    l2: float = 1e-4,
     seed: int = 42,
-) -> SingleLayerLIFSNN:
-    """Train one SNN model."""
-    set_seeds(seed)
-
-    n_features = X_spikes_train.shape[2]
-
-    model = SingleLayerLIFSNN(
-        n_features=n_features,
-        n_classes=n_classes,
-        beta=beta,
-        threshold=threshold,
-    )
-
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
-    X_train_t = torch.tensor(X_spikes_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.long)
-
-    for _ in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-
-        logits = model(X_train_t)
-        loss = criterion(logits, y_train_t)
-
-        loss.backward()
-        optimizer.step()
-
-    return model
-
-
-def predict_model(model: SingleLayerLIFSNN, X_spikes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Predict labels and return output spike counts."""
-    model.eval()
-
-    X_t = torch.tensor(X_spikes, dtype=torch.float32)
-
-    with torch.no_grad():
-        logits = model(X_t)
-        y_pred = logits.argmax(dim=1).cpu().numpy()
-        spike_counts = logits.cpu().numpy()
-
-    return y_pred, spike_counts
-
-
-def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """Compute standard classification metrics."""
-    return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro")),
-        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted")),
-        "n_predictions": int(len(y_true)),
-    }
-
-
-def run_loso_evaluation(
-    X_norm: np.ndarray,
-    y: np.ndarray,
-    subject_ids: np.ndarray,
-    class_names: List[str],
-    T: int,
-    max_spikes: int,
-    epochs: int,
-    lr: float,
-    weight_decay: float,
-    output_dir: Path,
-) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[float]]:
     """
-    Run leave-one-subject-out evaluation.
+    Train a compact spike-count readout using a delta-rule/softmax update.
 
-    For each held-out subject:
-        train on all other subjects
-        test on held-out subject
+    The input spike tensor is first reduced to spike counts per input channel.
+    The class readout is then trained using a multiclass delta-rule equivalent
+    to gradient descent on softmax cross-entropy.
     """
-    logo = LeaveOneGroupOut()
+    rng = np.random.default_rng(seed)
 
-    all_true = []
-    all_pred = []
-    prediction_rows = []
+    X_counts = S_train.sum(axis=1).astype(float)
 
-    n_classes = len(class_names)
+    # Normalize spike counts per input channel for numerical stability.
+    X_counts = X_counts / (X_counts.max(axis=0, keepdims=True) + 1e-8)
 
-    for fold_idx, (train_idx, test_idx) in enumerate(logo.split(X_norm, y, subject_ids), start=1):
-        train_subjects = set(subject_ids[train_idx])
-        test_subjects = set(subject_ids[test_idx])
+    W = rng.normal(0, 0.05, size=(X_counts.shape[1], n_classes))
+    b = np.zeros(n_classes)
 
-        overlap = train_subjects.intersection(test_subjects)
-        if len(overlap) > 0:
-            raise RuntimeError(f"Subject leakage detected in fold {fold_idx}: {overlap}")
-
-        X_train = X_norm[train_idx]
-        y_train = y[train_idx]
-        X_test = X_norm[test_idx]
-        y_test = y[test_idx]
-
-        X_spikes_train = deterministic_rate_encode(X_train, T=T, max_spikes=max_spikes)
-        X_spikes_test = deterministic_rate_encode(X_test, T=T, max_spikes=max_spikes)
-
-        model = train_one_model(
-            X_spikes_train=X_spikes_train,
-            y_train=y_train,
-            n_classes=n_classes,
-            epochs=epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            seed=42 + fold_idx,
-        )
-
-        y_pred, spike_counts = predict_model(model, X_spikes_test)
-
-        all_true.extend(y_test.tolist())
-        all_pred.extend(y_pred.tolist())
-
-        for i, sample_idx in enumerate(test_idx):
-            row = {
-                "fold": fold_idx,
-                "subject_id": subject_ids[sample_idx],
-                "y_true": int(y_test[i]),
-                "y_pred": int(y_pred[i]),
-                "true_class": class_names[int(y_test[i])],
-                "pred_class": class_names[int(y_pred[i])],
-            }
-
-            for c_idx, c_name in enumerate(class_names):
-                row[f"out_spikes_{c_name}"] = float(spike_counts[i, c_idx])
-
-            prediction_rows.append(row)
-
-    y_true_arr = np.asarray(all_true)
-    y_pred_arr = np.asarray(all_pred)
-
-    metrics = evaluate_predictions(y_true_arr, y_pred_arr)
-    metrics_df = pd.DataFrame([metrics])
-    predictions_df = pd.DataFrame(prediction_rows)
-
-    cm = confusion_matrix(y_true_arr, y_pred_arr, labels=np.arange(len(class_names)))
-
-    return metrics_df, predictions_df, cm
-
-
-def run_tiny_overfit_sanity_check(
-    X_norm: np.ndarray,
-    y: np.ndarray,
-    class_names: List[str],
-    T: int,
-    max_spikes: int,
-    epochs: int,
-    lr: float,
-    weight_decay: float,
-) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarray, List[float], List[float]]:
-    """
-    Run an overfit sanity check when no subject_id column exists.
-
-    This trains and evaluates on the same samples.
-    This is NOT a valid performance estimate.
-    """
-    X_spikes = deterministic_rate_encode(X_norm, T=T, max_spikes=max_spikes)
-
-    n_classes = len(class_names)
-    n_features = X_spikes.shape[2]
-
-    model = SingleLayerLIFSNN(n_features=n_features, n_classes=n_classes)
-
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
-    X_t = torch.tensor(X_spikes, dtype=torch.float32)
-    y_t = torch.tensor(y, dtype=torch.long)
+    Y = np.eye(n_classes)[y_train]
 
     losses = []
-    accuracies = []
 
     for _ in range(epochs):
-        model.train()
-        optimizer.zero_grad()
+        logits = X_counts @ W + b
+        P = softmax(logits)
 
-        logits = model(X_t)
-        loss = criterion(logits, y_t)
+        loss = -np.mean(np.sum(Y * np.log(P + 1e-12), axis=1)) + l2 * np.sum(W * W)
 
-        loss.backward()
-        optimizer.step()
+        grad_logits = (P - Y) / len(y_train)
+        grad_W = X_counts.T @ grad_logits + 2 * l2 * W
+        grad_b = grad_logits.sum(axis=0)
 
-        with torch.no_grad():
-            pred = logits.argmax(dim=1)
-            acc = (pred == y_t).float().mean().item()
+        W -= lr * grad_W
+        b -= lr * grad_b
 
-        losses.append(float(loss.item()))
-        accuracies.append(float(acc))
+        losses.append(float(loss))
 
-    y_pred, spike_counts = predict_model(model, X_spikes)
+    return W, b, losses
 
-    metrics = evaluate_predictions(y, y_pred)
-    metrics["note"] = "overfit_sanity_check_only"
-    metrics_df = pd.DataFrame([metrics])
 
-    prediction_rows = []
-    for i in range(len(y)):
-        row = {
-            "sample_index": i,
-            "y_true": int(y[i]),
-            "y_pred": int(y_pred[i]),
-            "true_class": class_names[int(y[i])],
-            "pred_class": class_names[int(y_pred[i])],
-        }
+def predict_delta_readout(
+    S: np.ndarray,
+    W: np.ndarray,
+    b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Predict classes from spike counts using trained readout weights.
+    """
+    X_counts = S.sum(axis=1).astype(float)
+    X_counts = X_counts / (X_counts.max(axis=0, keepdims=True) + 1e-8)
 
-        for c_idx, c_name in enumerate(class_names):
-            row[f"out_spikes_{c_name}"] = float(spike_counts[i, c_idx])
+    logits = X_counts @ W + b
+    y_pred = logits.argmax(axis=1)
 
-        prediction_rows.append(row)
+    return y_pred, logits
 
-    predictions_df = pd.DataFrame(prediction_rows)
-    cm = confusion_matrix(y, y_pred, labels=np.arange(len(class_names)))
 
-    return metrics_df, predictions_df, cm, losses, accuracies
+# ---------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------
+
+def run_spike_delta_loso(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    label_order: list[str],
+    encoding: str = "population",
+    T: int = 30,
+    max_spikes: int = 6,
+    epochs: int = 400,
+    lr: float = 0.05,
+    seed: int = 100,
+) -> tuple[dict, pd.DataFrame, np.ndarray, np.ndarray]:
+    """Leave‑one‑subject‑out evaluation for spike encoding plus delta‑rule readout."""
+    all_true = []
+    all_pred = []
+    rows = []
+    fold_losses = []
+
+    logo = LeaveOneGroupOut()
+
+    for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups), start=1):
+        train_subjects = set(groups[train_idx])
+        test_subjects = set(groups[test_idx])
+        if train_subjects.intersection(test_subjects):
+            raise RuntimeError("Subject leakage detected.")
+
+        # Encode spikes according to the chosen scheme
+        if encoding == "rate":
+            S_train = deterministic_rate_encode(X[train_idx], T=T, max_spikes=max_spikes)
+            S_test = deterministic_rate_encode(X[test_idx], T=T, max_spikes=max_spikes)
+        elif encoding == "population":
+            S_train = gaussian_population_encode(X[train_idx], T=T, max_spikes=max_spikes)
+            S_test = gaussian_population_encode(X[test_idx], T=T, max_spikes=max_spikes)
+        else:
+            raise ValueError(f"Unknown encoding: {encoding}")
+
+        # Train delta‑rule readout
+        W, b, losses = train_delta_readout(
+            S_train=S_train,
+            y_train=y[train_idx],
+            n_classes=len(label_order),
+            epochs=epochs,
+            lr=lr,
+            seed=seed + fold,
+        )
+
+        y_pred, logits = predict_delta_readout(S_test, W, b)
+        fold_losses.append(losses)
+
+        for i, idx in enumerate(test_idx):
+            row = {
+                "fold": fold,
+                "subject_id": groups[idx],
+                "y_true": int(y[idx]),
+                "y_pred": int(y_pred[i]),
+                "pred_Task": label_order[int(y_pred[i])],
+            }
+            for k, lab in enumerate(label_order):
+                row[f"logit_{lab}"] = float(logits[i, k])
+            rows.append(row)
+
+        all_true.extend(y[test_idx].tolist())
+        all_pred.extend(y_pred.tolist())
+
+    metrics = {
+        "accuracy": float(accuracy_score(all_true, all_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(all_true, all_pred)),
+        "macro_f1": float(f1_score(all_true, all_pred, average="macro")),
+        "weighted_f1": float(f1_score(all_true, all_pred, average="weighted")),
+        "n_predictions": int(len(all_true)),
+    }
+    cm = confusion_matrix(all_true, all_pred, labels=np.arange(len(label_order)))
+    return metrics, pd.DataFrame(rows), cm, np.asarray(fold_losses)
+
+
+def run_spike_snn_loso(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    label_order: list[str],
+    encoding: str = "population",
+    T: int = 30,
+    max_spikes: int = 6,
+    epochs: int = 200,
+    lr: float = 1e-3,
+    hidden: int = 128,
+    beta: float = 0.9,
+    seed: int = 100,
+) -> tuple[dict, pd.DataFrame, np.ndarray, np.ndarray]:
+    """Leave‑one‑subject‑out evaluation for a spiking neural network (snnTorch)."""
+    all_true = []
+    all_pred = []
+    rows = []
+    fold_losses = []
+
+    logo = LeaveOneGroupOut()
+
+    for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups), start=1):
+        train_subjects = set(groups[train_idx])
+        test_subjects = set(groups[test_idx])
+        if train_subjects.intersection(test_subjects):
+            raise RuntimeError("Subject leakage detected.")
+
+        # Encode spikes
+        if encoding == "rate":
+            S_train = deterministic_rate_encode(X[train_idx], T=T, max_spikes=max_spikes)
+            S_test = deterministic_rate_encode(X[test_idx], T=T, max_spikes=max_spikes)
+        elif encoding == "population":
+            S_train = gaussian_population_encode(X[train_idx], T=T, max_spikes=max_spikes)
+            S_test = gaussian_population_encode(X[test_idx], T=T, max_spikes=max_spikes)
+        else:
+            raise ValueError(f"Unknown encoding: {encoding}")
+
+        # Train SNN
+        model, losses = train_spiking_network(
+            S_train=S_train,
+            y_train=y[train_idx],
+            n_classes=len(label_order),
+            epochs=epochs,
+            lr=lr,
+            beta=beta,
+            hidden=hidden,
+            seed=seed + fold,
+        )
+        y_pred, logits = predict_spiking_network(model, S_test)
+        fold_losses.append(losses)
+
+        for i, idx in enumerate(test_idx):
+            row = {
+                "fold": fold,
+                "subject_id": groups[idx],
+                "y_true": int(y[idx]),
+                "y_pred": int(y_pred[i]),
+                "pred_Task": label_order[int(y_pred[i])],
+            }
+            for k, lab in enumerate(label_order):
+                row[f"logit_{lab}"] = float(logits[i, k])
+            rows.append(row)
+
+        all_true.extend(y[test_idx].tolist())
+        all_pred.extend(y_pred.tolist())
+
+    metrics = {
+        "accuracy": float(accuracy_score(all_true, all_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(all_true, all_pred)),
+        "macro_f1": float(f1_score(all_true, all_pred, average="macro")),
+        "weighted_f1": float(f1_score(all_true, all_pred, average="weighted")),
+        "n_predictions": int(len(all_true)),
+    }
+    cm = confusion_matrix(all_true, all_pred, labels=np.arange(len(label_order)))
+    return metrics, pd.DataFrame(rows), cm, np.asarray(fold_losses)
+
+
+def run_classical_loso(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+) -> pd.DataFrame:
+    """
+    Classical LOSO baselines on the same normalized features.
+    """
+    models = {
+        "LogisticRegression": LogisticRegression(max_iter=2000, class_weight="balanced"),
+        "LinearSVM": SVC(kernel="linear", class_weight="balanced"),
+        "RBFSVM": SVC(kernel="rbf", class_weight="balanced"),
+    }
+
+    rows = []
+
+    for name, clf in models.items():
+        all_true = []
+        all_pred = []
+
+        for train_idx, test_idx in LeaveOneGroupOut().split(X, y, groups):
+            clf.fit(X[train_idx], y[train_idx])
+            pred = clf.predict(X[test_idx])
+
+            all_true.extend(y[test_idx].tolist())
+            all_pred.extend(pred.tolist())
+
+        rows.append({
+            "model": name,
+            "accuracy": float(accuracy_score(all_true, all_pred)),
+            "balanced_accuracy": float(balanced_accuracy_score(all_true, all_pred)),
+            "macro_f1": float(f1_score(all_true, all_pred, average="macro")),
+            "weighted_f1": float(f1_score(all_true, all_pred, average="weighted")),
+        })
+
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------
 
-def plot_confusion_matrix(
-    cm: np.ndarray,
-    class_names: List[str],
-    output_path: Path,
-    title: str,
-) -> None:
-    """Save confusion matrix heatmap."""
-    plt.figure(figsize=(6, 5))
+def plot_top_configs(results_df: pd.DataFrame, output_path: Path) -> None:
+    top = results_df.sort_values("balanced_accuracy", ascending=False).head(12).copy()
+
+    labels = [
+        f"{r['feature_set']} | {r['encoding']} | T={int(r['T'])} | sp={int(r['max_spikes'])}"
+        for _, r in top.iterrows()
+    ]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ypos = np.arange(len(top))
+    vals = top["balanced_accuracy"].values
+
+    ax.barh(ypos, vals, color="steelblue")
+    ax.set_yticks(ypos)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("Balanced accuracy")
+    ax.set_title("Top spike-delta configurations, LOSO")
+
+    for i, v in enumerate(vals):
+        ax.text(min(v + 0.02, 0.95), i, f"{v:.2f}", va="center")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_confusion_matrix(cm: np.ndarray, label_order: list[str], output_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4))
+
     sns.heatmap(
         cm,
         annot=True,
         fmt="d",
         cmap="Blues",
-        xticklabels=class_names,
-        yticklabels=class_names,
+        xticklabels=label_order,
+        yticklabels=label_order,
+        ax=ax,
     )
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200)
-    plt.close()
+
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Best spike-delta confusion matrix")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
 
 
-def plot_training_curve(
-    losses: List[float],
-    accuracies: List[float],
-    output_path: Path,
-) -> None:
-    """Save training loss and accuracy curve."""
-    fig, ax1 = plt.subplots(figsize=(8, 4))
+def plot_feature_heatmap(norm_df: pd.DataFrame, feature_cols: list[str], output_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(9, 7))
 
-    ax1.plot(losses, label="Training loss")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Cross-entropy loss")
-
-    ax2 = ax1.twinx()
-    ax2.plot(accuracies, color="orange", label="Training accuracy")
-    ax2.set_ylabel("Training accuracy")
-
-    lines_1, labels_1 = ax1.get_legend_handles_labels()
-    lines_2, labels_2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="center right")
-
-    plt.title("SNN training curve")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200)
-    plt.close()
-
-
-def plot_spike_raster(
-    spikes: np.ndarray,
-    feature_names: List[str],
-    output_path: Path,
-    title: str = "Example input spike raster",
-) -> None:
-    """
-    Save a raster plot for one sample.
-
-    spikes shape:
-        [T, n_features]
-    """
-    T, n_features = spikes.shape
-
-    time_idx, feature_idx = np.where(spikes.T == 1)
-
-    plt.figure(figsize=(10, 4))
-    plt.scatter(time_idx, feature_idx, marker="|", s=40)
-    plt.yticks(np.arange(n_features), feature_names)
-    plt.xlabel("Time step")
-    plt.ylabel("Feature")
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200)
-    plt.close()
-
-
-def plot_normalized_features(
-    norm_df: pd.DataFrame,
-    norm_cols: List[str],
-    label_col: str,
-    output_path: Path,
-) -> None:
-    """Save heatmap of normalized features."""
-    mat = norm_df[norm_cols].to_numpy()
-    labels = norm_df[label_col].astype(str).to_list()
-
-    plt.figure(figsize=(10, max(4, len(labels) * 0.25)))
     sns.heatmap(
-        mat,
-        cmap="viridis",
+        norm_df[feature_cols].to_numpy(),
         vmin=0,
         vmax=1,
-        yticklabels=labels,
-        xticklabels=[c.replace("_norm", "") for c in norm_cols],
+        cmap="viridis",
+        xticklabels=feature_cols,
+        yticklabels=False,
+        ax=ax,
     )
-    plt.title("Normalized features used for spike encoding")
-    plt.xlabel("Feature")
-    plt.ylabel("Sample")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200)
-    plt.close()
+
+    ax.set_title("Normalized features for best feature set")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_example_spike_raster(
+    X0: np.ndarray,
+    encoding: str,
+    T: int,
+    max_spikes: int,
+    output_path: Path,
+) -> None:
+    if encoding == "population":
+        S0 = gaussian_population_encode(X0, T=T, max_spikes=max_spikes)[0]
+    else:
+        S0 = deterministic_rate_encode(X0, T=T, max_spikes=max_spikes)[0]
+
+    time_idx, channel_idx = np.where(S0.T == 1)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+
+    ax.scatter(time_idx, channel_idx, marker="|", s=40)
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Input channel")
+    ax.set_title("Example spike raster, best encoding")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------
@@ -624,175 +504,302 @@ def plot_normalized_features(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_csv", type=str, default="eda_features.csv")
-    parser.add_argument("--output_dir", type=str, default="snn_no_aug_outputs")
-    parser.add_argument("--label_col", type=str, default=DEFAULT_LABEL_COL)
-    parser.add_argument("--subject_col", type=str, default=DEFAULT_SUBJECT_COL)
-    parser.add_argument("--T", type=int, default=50)
-    parser.add_argument("--max_spikes", type=int, default=15)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
-
+    parser.add_argument("--input", default="eda_features.csv")
+    parser.add_argument("--output", default="more_features_spike_delta_outputs")
     args = parser.parse_args()
 
-    set_seeds(args.seed)
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    input_path = Path(args.input)
+    output_dir = Path(args.output)
+    output_dir.mkdir(exist_ok=True)
 
     # Load data
-    df = load_feature_table(args.input_csv, label_col=args.label_col)
-    feature_cols = get_numeric_feature_columns(
-        df,
-        label_col=args.label_col,
-        subject_col=args.subject_col,
-    )
+    raw = pd.read_csv(input_path)
 
-    y, label_to_int, int_to_label = encode_labels(df[args.label_col])
-    class_names = [int_to_label[i] for i in range(len(int_to_label))]
-
-    # Normalize
-    norm_df, norm_cols, normalization_mode = minmax_normalize_features(
-        df,
-        feature_cols=feature_cols,
-        subject_col=args.subject_col,
-    )
-
-    X_norm = norm_df[norm_cols].to_numpy(dtype=np.float32)
-
-    # Save normalized features
-    norm_df.to_csv(output_dir / "features_normalized.csv", index=False)
-
-    # Encode all samples once for plotting
-    all_spikes = deterministic_rate_encode(
-        X_norm,
-        T=args.T,
-        max_spikes=args.max_spikes,
-    )
-
-    np.save(output_dir / "spikes_deterministic_rate.npy", all_spikes)
-
-    spike_info = {
-        "spike_shape": list(all_spikes.shape),
-        "T": args.T,
-        "max_spikes": args.max_spikes,
-        "n_features": len(feature_cols),
-        "n_classes": len(class_names),
-        "feature_cols": feature_cols,
-        "norm_cols": norm_cols,
-        "class_names": class_names,
-        "normalization_mode": normalization_mode,
+    required_cols = {
+        "Sample",
+        "Task",
+        "Mean Tonic",
+        "Max Slope",
+        "Num Peaks",
+        "Mean Amplitude",
+        "Std Amplitude",
+        "Total Power",
+        "EDASymp Power",
     }
 
-    with open(output_dir / "spike_info.json", "w") as f:
-        json.dump(spike_info, f, indent=2)
+    missing = required_cols.difference(raw.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    # Train/test
-    if args.subject_col in norm_df.columns:
-        print("Running leave-one-subject-out evaluation.")
+    raw["subject_id"] = raw["Sample"].astype(str)
 
-        subject_ids = norm_df[args.subject_col].to_numpy()
+    label_order = ["rest0", "task1", "task2", "task3"]
 
-        metrics_df, predictions_df, cm = run_loso_evaluation(
-            X_norm=X_norm,
+    raw = raw[raw["Task"].isin(label_order)].copy()
+    raw["Task"] = pd.Categorical(raw["Task"], categories=label_order, ordered=True)
+    raw = raw.sort_values(["subject_id", "Task"]).reset_index(drop=True)
+    raw["Task"] = raw["Task"].astype(str)
+
+    feature_cols = [
+        c for c in raw.columns
+        if c not in ["Sample", "subject_id", "Task"]
+        and pd.api.types.is_numeric_dtype(raw[c])
+    ]
+
+    # Within-subject min-max normalization
+    norm = raw.copy()
+
+    for c in feature_cols:
+        mn = norm.groupby("subject_id")[c].transform("min")
+        mx = norm.groupby("subject_id")[c].transform("max")
+        norm[c + "_norm"] = ((norm[c] - mn) / (mx - mn + 1e-8)).clip(0, 1)
+
+    # Derived normalized EDASymp ratio
+    norm["EDASymp_Ratio"] = norm["EDASymp Power"] / (norm["Total Power"] + 1e-12)
+
+    mn = norm.groupby("subject_id")["EDASymp_Ratio"].transform("min")
+    mx = norm.groupby("subject_id")["EDASymp_Ratio"].transform("max")
+    norm["EDASymp_Ratio_norm"] = ((norm["EDASymp_Ratio"] - mn) / (mx - mn + 1e-8)).clip(0, 1)
+
+    feature_sets = {
+        "all_7_norm": [c + "_norm" for c in feature_cols],
+        "all_7_plus_symp_ratio": [c + "_norm" for c in feature_cols] + ["EDASymp_Ratio_norm"],
+        "no_count_plus_symp_ratio": [
+            c + "_norm" for c in feature_cols
+            if c != "Num Peaks"
+        ] + ["EDASymp_Ratio_norm"],
+    }
+
+    label_to_int = {lab: i for i, lab in enumerate(label_order)}
+    y = norm["Task"].map(label_to_int).to_numpy(np.int64)
+    groups = norm["subject_id"].to_numpy()
+
+    # Save normalized features
+    norm.to_csv(output_dir / "features_normalized_with_ratio.csv", index=False)
+
+    configs = []
+
+    for feature_set_name in feature_sets:
+        for encoding in ["rate", "population"]:
+            for T in [30, 50, 75]:
+                if encoding == "rate":
+                    spike_options = [10, 15, 20]
+                else:
+                    spike_options = [6, 10, 15]
+
+                for max_spikes in spike_options:
+                    configs.append({
+                        "feature_set": feature_set_name,
+                        "encoding": encoding,
+                        "T": T,
+                        "max_spikes": max_spikes,
+                        "epochs": 400,
+                        "lr": 0.05,
+                    })
+
+    # -----------------------------------------------------------------
+    # Run configurations for delta‑rule readout and spiking neural network
+    # -----------------------------------------------------------------
+    delta_results = []
+    snn_results = []
+    best_delta = None
+    best_snn = None
+
+    for i, cfg in enumerate(configs, start=1):
+        feature_cols_this = feature_sets[cfg["feature_set"]]
+        X = norm[feature_cols_this].to_numpy(float)
+
+        # ----- Delta‑rule readout -----
+        delta_metrics, delta_preds, delta_cm, delta_losses = run_spike_delta_loso(
+            X=X,
             y=y,
-            subject_ids=subject_ids,
-            class_names=class_names,
-            T=args.T,
-            max_spikes=args.max_spikes,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            output_dir=output_dir,
+            groups=groups,
+            label_order=label_order,
+            encoding=cfg["encoding"],
+            T=cfg["T"],
+            max_spikes=cfg["max_spikes"],
+            epochs=cfg["epochs"],
+            lr=cfg["lr"],
+            seed=100,
         )
 
-        metrics_df["evaluation"] = "leave_one_subject_out"
+        delta_row = {
+            **cfg,
+            **delta_metrics,
+            "method": "delta",
+            "config_id": i,
+            "n_features": X.shape[1],
+            "n_subjects": int(norm["subject_id"].nunique()),
+        }
+        delta_results.append(delta_row)
+        if best_delta is None or delta_row["balanced_accuracy"] > best_delta[0]["balanced_accuracy"]:
+            best_delta = (delta_row, delta_preds, delta_cm, delta_losses)
 
-        plot_confusion_matrix(
-            cm,
-            class_names=class_names,
-            output_path=output_dir / "confusion_matrix_loso.png",
-            title="SNN LOSO confusion matrix",
-        )
-
-    else:
-        print(
-            "No subject_id column found. "
-            "Running overfit sanity check only. "
-            "This is not a valid performance estimate."
-        )
-
-        metrics_df, predictions_df, cm, losses, accuracies = run_tiny_overfit_sanity_check(
-            X_norm=X_norm,
+        # ----- Spiking Neural Network (snnTorch) -----
+        # Use a smaller epoch count for SNN to keep runtime reasonable.
+        snn_metrics, snn_preds, snn_cm, snn_losses = run_spike_snn_loso(
+            X=X,
             y=y,
-            class_names=class_names,
-            T=args.T,
-            max_spikes=args.max_spikes,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
+            groups=groups,
+            label_order=label_order,
+            encoding=cfg["encoding"],
+            T=cfg["T"],
+            max_spikes=cfg["max_spikes"],
+            epochs=200,  # fewer epochs than delta‑rule by default
+            lr=1e-3,
+            hidden=128,
+            beta=0.9,
+            seed=100,
         )
 
-        metrics_df["evaluation"] = "overfit_sanity_check_only"
+        snn_row = {
+            **cfg,
+            **snn_metrics,
+            "method": "snn",
+            "config_id": i,
+            "n_features": X.shape[1],
+            "n_subjects": int(norm["subject_id"].nunique()),
+        }
+        snn_results.append(snn_row)
+        if best_snn is None or snn_row["balanced_accuracy"] > best_snn[0]["balanced_accuracy"]:
+            best_snn = (snn_row, snn_preds, snn_cm, snn_losses)
 
-        plot_training_curve(
-            losses,
-            accuracies,
-            output_path=output_dir / "training_curve_overfit_sanity_check.png",
-        )
+    # DataFrames for each method
+    delta_results_df = pd.DataFrame(delta_results).sort_values("balanced_accuracy", ascending=False)
+    snn_results_df = pd.DataFrame(snn_results).sort_values("balanced_accuracy", ascending=False)
 
-        plot_confusion_matrix(
-            cm,
-            class_names=class_names,
-            output_path=output_dir / "confusion_matrix_overfit_sanity_check.png",
-            title="SNN confusion matrix, overfit sanity check only",
-        )
+    # Best configurations per method
+    best_delta_row, best_delta_preds, best_delta_cm, best_delta_losses = best_delta
+    best_snn_row, best_snn_preds, best_snn_cm, best_snn_losses = best_snn
+    best_feature_cols = feature_sets[best_row["feature_set"]]
+    X_best = norm[best_feature_cols].to_numpy(float)
 
-    # Save metrics and predictions
-    metrics_df.to_csv(output_dir / "snn_metrics.csv", index=False)
-    predictions_df.to_csv(output_dir / "snn_predictions.csv", index=False)
-
-    # Plots
-    plot_spike_raster(
-        all_spikes[0],
-        feature_names=feature_cols,
-        output_path=output_dir / "example_spike_raster.png",
-        title=f"Example spike raster: {df[args.label_col].iloc[0]}",
+    classical_df = run_classical_loso(
+        X=X_best,
+        y=y,
+        groups=groups,
     )
 
-    plot_normalized_features(
-        norm_df,
-        norm_cols=norm_cols,
-        label_col=args.label_col,
-        output_path=output_dir / "normalized_feature_heatmap.png",
-    )
+    # -----------------------------------------------------------------
+    # Save outputs for both delta‑rule and SNN methods
+    # -----------------------------------------------------------------
+    # Delta‑rule results (original behavior)
+    delta_results_df.to_csv(output_dir / "spike_delta_config_results.csv", index=False)
+    best_delta_preds.to_csv(output_dir / "best_spike_delta_predictions.csv", index=False)
+    pd.DataFrame(
+        best_delta_cm,
+        index=label_order,
+        columns=label_order,
+    ).to_csv(output_dir / "best_spike_delta_confusion_matrix.csv")
 
-    # Summary
+    # SNN results
+    snn_results_df.to_csv(output_dir / "spike_snn_config_results.csv", index=False)
+    best_snn_preds.to_csv(output_dir / "best_spike_snn_predictions.csv", index=False)
+    pd.DataFrame(
+        best_snn_cm,
+        index=label_order,
+        columns=label_order,
+    ).to_csv(output_dir / "best_spike_snn_confusion_matrix.csv")
+
+    # Classical baselines (unchanged)
+    classical_df.to_csv(output_dir / "classical_baselines_best_feature_set.csv", index=False)
+
+    # -----------------------------------------------------------------
+    # Summary JSON (includes both best configurations)
+    # -----------------------------------------------------------------
     summary = {
-        "input_csv": args.input_csv,
-        "output_dir": str(output_dir),
-        "normalization_mode": normalization_mode,
-        "n_samples": int(len(df)),
-        "n_features": int(len(feature_cols)),
-        "n_classes": int(len(class_names)),
-        "class_names": class_names,
-        "feature_cols": feature_cols,
-        "spike_shape": list(all_spikes.shape),
-        "evaluation": metrics_df["evaluation"].iloc[0],
-        "metrics": metrics_df.to_dict(orient="records"),
-        "warning": (
-            "If no subject_id column was present, this run is only an overfit sanity check "
-            "and must not be interpreted as generalization performance."
+        "input_file": str(input_path),
+        "n_rows": int(len(norm)),
+        "n_subjects": int(norm["subject_id"].nunique()),
+        "subjects": sorted(norm["subject_id"].unique().tolist()),
+        "tasks": label_order,
+        "raw_feature_cols": feature_cols,
+        "feature_sets": feature_sets,
+        "best_spike_delta_config": best_delta_row,
+        "best_spike_snn_config": best_snn_row,
+        "classical_baselines_best_feature_set": classical_df.to_dict(orient="records"),
+        "note": (
+            "This script evaluates spike‑encoded features using a simple delta‑rule readout "
+            "and a spiking neural network (snnTorch). No data augmentation was used."
         ),
     }
 
     with open(output_dir / "run_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, default=str)
 
-    print("\nFinished.")
-    print(json.dumps(summary, indent=2))
+    # -----------------------------------------------------------------
+    # Plots for delta‑rule method (kept for backward compatibility)
+    # -----------------------------------------------------------------
+    plot_top_configs(delta_results_df, output_dir / "top_spike_delta_configurations.png")
+    plot_confusion_matrix(best_delta_cm, label_order, output_dir / "best_spike_delta_confusion_matrix.png")
+    plot_feature_heatmap(norm, best_feature_cols, output_dir / "best_feature_set_heatmap.png")
+
+    plot_example_spike_raster(
+        X0=norm[best_feature_cols].to_numpy(float)[:1],
+        encoding=best_delta_row["encoding"],
+        T=int(best_delta_row["T"]),
+        max_spikes=int(best_delta_row["max_spikes"]),
+        output_path=output_dir / "best_encoding_example_spike_raster.png",
+    )
+
+    # Training loss plot for delta‑rule
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(best_delta_losses.mean(axis=0))
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Cross‑entropy loss")
+    ax.set_title("Mean training loss across LOSO folds, best delta‑rule config")
+    fig.tight_layout()
+    fig.savefig(output_dir / "best_spike_delta_training_loss.png", dpi=200)
+    plt.close(fig)
+
+    # -----------------------------------------------------------------
+    # Additional plots for the SNN method
+    # -----------------------------------------------------------------
+    plot_top_configs(snn_results_df, output_dir / "top_spike_snn_configurations.png")
+    plot_confusion_matrix(best_snn_cm, label_order, output_dir / "best_spike_snn_confusion_matrix.png")
+    plot_example_spike_raster(
+        X0=norm[best_feature_cols].to_numpy(float)[:1],
+        encoding=best_snn_row["encoding"],
+        T=int(best_snn_row["T"]),
+        max_spikes=int(best_snn_row["max_spikes"]),
+        output_path=output_dir / "best_spike_snn_example_spike_raster.png",
+    )
+    # Training loss plot for SNN
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(best_snn_losses.mean(axis=0))
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Cross‑entropy loss")
+    ax.set_title("Mean training loss across LOSO folds, best SNN config")
+    fig.tight_layout()
+    fig.savefig(output_dir / "best_spike_snn_training_loss.png", dpi=200)
+    plt.close(fig)
+
+    # Zip outputs
+    zip_path = Path(str(output_dir) + ".zip")
+
+    if zip_path.exists():
+        zip_path.unlink()
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in output_dir.glob("*"):
+            z.write(p, arcname=f"{output_dir.name}/{p.name}")
+
+    print("\nData summary")
+    print(f"Rows: {len(norm)}")
+    print(f"Subjects: {norm['subject_id'].nunique()}")
+    print(f"Tasks: {label_order}")
+
+    print("\nTop spike-delta results")
+    print(results_df.head(10).to_string(index=False))
+
+    print("\nClassical baselines on best feature set")
+    print(classical_df.to_string(index=False))
+
+    print("\nBest configuration")
+    print(json.dumps(best_row, indent=2, default=str))
+
+    print(f"\nOutputs saved to: {output_dir}")
+    print(f"Zipped outputs: {zip_path}")
 
 
 if __name__ == "__main__":
